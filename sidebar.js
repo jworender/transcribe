@@ -15,9 +15,10 @@ let allTranscripts = []; // Store all transcripts for summary generation
 let summaryTimer = null;
 let lastSummaryTime = 0;
 const summaryIntervalMs = 30000; // 30 seconds
-let baseSummaryWordCount = 300; // Starting summary length
+let baseSummaryWordCount = 200; // Starting summary length
 let lastTranscriptLength = 0; // Track transcript growth
-let currentSummaryWordCount = 300; // Dynamic summary length
+let currentSummaryWordCount = 200; // Dynamic summary length
+let minTranscriptWordsForGrowth = 400; // Don't grow summary until transcript exceeds this word count
 
 // Silence detection parameters
 const silenceThreshold = 0.01;
@@ -485,7 +486,7 @@ async function transcribeAudio(blob, apiKey) {
   }
 }
 
-// Generate summary using OpenAI GPT with proportional growth
+// Generate summary using OpenAI GPT with proportional growth after threshold
 async function generateSummary(apiKey) {
   if (allTranscripts.length === 0) return;
   
@@ -495,22 +496,28 @@ async function generateSummary(apiKey) {
     
     // Combine all transcripts into a single text
     const allText = allTranscripts.join(' ');
-    const currentTranscriptLength = allText.length;
+    const currentTranscriptWordCount = allText.split(/\s+/).length;
     
-    // Calculate proportional growth for summary word count
-    if (lastTranscriptLength > 0) {
+    // Only allow proportional growth after transcript exceeds the minimum threshold
+    if (currentTranscriptWordCount >= minTranscriptWordsForGrowth && lastTranscriptLength > 0) {
+      const currentTranscriptLength = allText.length;
       const growthRatio = currentTranscriptLength / lastTranscriptLength;
       currentSummaryWordCount = Math.round(currentSummaryWordCount * growthRatio);
       
       // Cap at reasonable maximum to avoid token limits
       currentSummaryWordCount = Math.min(currentSummaryWordCount, 800);
       
+      console.log(`Sidebar: Transcript has ${currentTranscriptWordCount} words (threshold: ${minTranscriptWordsForGrowth})`);
       console.log(`Sidebar: Transcript grew from ${lastTranscriptLength} to ${currentTranscriptLength} chars (${(growthRatio * 100).toFixed(1)}% growth)`);
       console.log(`Sidebar: Summary target updated to ${currentSummaryWordCount} words`);
+    } else {
+      // Keep base summary length until threshold is reached
+      currentSummaryWordCount = baseSummaryWordCount;
+      console.log(`Sidebar: Transcript has ${currentTranscriptWordCount} words (below ${minTranscriptWordsForGrowth} threshold), keeping ${baseSummaryWordCount}-word summary`);
     }
     
     // Update tracking variable for next iteration
-    lastTranscriptLength = currentTranscriptLength;
+    lastTranscriptLength = allText.length;
     
     // Limit text length to avoid token limits (approximately 3000 tokens)
     const maxLength = 12000; // roughly 3000 tokens
