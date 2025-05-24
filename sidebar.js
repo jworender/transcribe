@@ -15,6 +15,9 @@ let allTranscripts = []; // Store all transcripts for summary generation
 let summaryTimer = null;
 let lastSummaryTime = 0;
 const summaryIntervalMs = 30000; // 30 seconds
+let baseSummaryWordCount = 300; // Starting summary length
+let lastTranscriptLength = 0; // Track transcript growth
+let currentSummaryWordCount = 300; // Dynamic summary length
 
 // Silence detection parameters
 const silenceThreshold = 0.01;
@@ -173,6 +176,10 @@ function startRecordingWithStream(stream, apiKey) {
   lastFullTranscript = '';
   allTranscripts = [];
   lastSummaryTime = Date.now();
+  
+  // Reset summary tracking variables
+  lastTranscriptLength = 0;
+  currentSummaryWordCount = baseSummaryWordCount;
   
   // Update summary status
   summaryStatusElement.textContent = 'Recording started...';
@@ -478,7 +485,7 @@ async function transcribeAudio(blob, apiKey) {
   }
 }
 
-// Generate summary using OpenAI GPT
+// Generate summary using OpenAI GPT with proportional growth
 async function generateSummary(apiKey) {
   if (allTranscripts.length === 0) return;
   
@@ -488,13 +495,29 @@ async function generateSummary(apiKey) {
     
     // Combine all transcripts into a single text
     const allText = allTranscripts.join(' ');
+    const currentTranscriptLength = allText.length;
+    
+    // Calculate proportional growth for summary word count
+    if (lastTranscriptLength > 0) {
+      const growthRatio = currentTranscriptLength / lastTranscriptLength;
+      currentSummaryWordCount = Math.round(currentSummaryWordCount * growthRatio);
+      
+      // Cap at reasonable maximum to avoid token limits
+      currentSummaryWordCount = Math.min(currentSummaryWordCount, 800);
+      
+      console.log(`Sidebar: Transcript grew from ${lastTranscriptLength} to ${currentTranscriptLength} chars (${(growthRatio * 100).toFixed(1)}% growth)`);
+      console.log(`Sidebar: Summary target updated to ${currentSummaryWordCount} words`);
+    }
+    
+    // Update tracking variable for next iteration
+    lastTranscriptLength = currentTranscriptLength;
     
     // Limit text length to avoid token limits (approximately 3000 tokens)
     const maxLength = 12000; // roughly 3000 tokens
     const textToSummarize = allText.length > maxLength ? 
       allText.slice(-maxLength) : allText;
     
-    console.log('Sidebar: Generating summary for', textToSummarize.length, 'characters');
+    console.log('Sidebar: Generating summary for', textToSummarize.length, 'characters, target length:', currentSummaryWordCount, 'words');
     
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -507,14 +530,14 @@ async function generateSummary(apiKey) {
         messages: [
           {
             role: 'system',
-            content: 'You are a helpful assistant that creates concise, informative summaries of audio transcriptions. Focus on key points, main topics, and important information. Keep the summary clear and well-organized.'
+            content: `You are a helpful assistant that creates comprehensive summaries of audio transcriptions. Focus on key points, main topics, and important information. Keep the summary clear and well-organized. Target approximately ${currentSummaryWordCount} words in your summary.`
           },
           {
             role: 'user',
-            content: `Please provide a concise summary of the following audio transcription:\n\n${textToSummarize}`
+            content: `Please provide a comprehensive summary of approximately ${currentSummaryWordCount} words for the following audio transcription:\n\n${textToSummarize}`
           }
         ],
-        max_tokens: 300,
+        max_tokens: Math.min(Math.round(currentSummaryWordCount * 1.3), 1000), // Allow some flexibility in token limit
         temperature: 0.3
       })
     });
@@ -540,8 +563,10 @@ async function generateSummary(apiKey) {
     if (summary) {
       updateSummary(summary);
       const now = new Date();
-      summaryStatusElement.textContent = `Updated ${now.toLocaleTimeString()}`;
+      const wordCount = summary.split(/\s+/).length;
+      summaryStatusElement.textContent = `Updated ${now.toLocaleTimeString()} (${wordCount} words)`;
       summaryStatusElement.className = '';
+      lastSummaryTime = Date.now();
     } else {
       console.error('Sidebar: No summary content received');
       summaryStatusElement.textContent = 'Summary generation failed';
