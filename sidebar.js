@@ -39,6 +39,26 @@ const transcriptContainer = document.getElementById('transcript');
 const summaryContainer = document.getElementById('summary');
 const summaryStatusElement = document.getElementById('summary-status');
 
+// Global error handler to prevent crashes
+window.addEventListener('error', (event) => {
+  console.error('Sidebar: Global error caught:', event.error);
+  // Don't let summary errors stop transcription
+  if (event.error && event.error.stack && event.error.stack.includes('generateSummary')) {
+    console.log('Sidebar: Summary error isolated, continuing transcription');
+    event.preventDefault();
+  }
+});
+
+// Unhandled promise rejection handler
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('Sidebar: Unhandled promise rejection:', event.reason);
+  // Don't let summary promise rejections stop transcription
+  if (event.reason && event.reason.stack && event.reason.stack.includes('generateSummary')) {
+    console.log('Sidebar: Summary promise rejection isolated, continuing transcription');
+    event.preventDefault();
+  }
+});
+
 // Connect to background script
 function connectToBackground() {
   backgroundPort = chrome.runtime.connect({ name: "sidebar" });
@@ -185,7 +205,7 @@ function startRecordingWithStream(stream, apiKey) {
   // Update summary status
   summaryStatusElement.textContent = 'Recording started...';
   
-  // Start summary timer
+  // Start summary timer with error isolation
   startSummaryTimer(apiKey);
   
   // Start overlapping recording cycles for continuous audio
@@ -199,10 +219,33 @@ function startSummaryTimer(apiKey) {
   }
   
   summaryTimer = setInterval(() => {
-    if (isRecording && allTranscripts.length > 0) {
-      generateSummary(apiKey);
+    try {
+      if (isRecording && allTranscripts.length > 0) {
+        // Run summary generation in isolated async context
+        generateSummaryAsync(apiKey);
+      }
+    } catch (err) {
+      console.error('Sidebar: Summary timer error (isolated):', err);
+      // Don't let summary errors affect transcription
+      summaryStatusElement.textContent = 'Summary error (isolated)';
+      summaryStatusElement.className = 'summary-error';
     }
   }, summaryIntervalMs);
+}
+
+// Isolated async summary generation to prevent blocking main thread
+async function generateSummaryAsync(apiKey) {
+  // Use setTimeout to ensure this runs in next tick, completely isolated
+  setTimeout(async () => {
+    try {
+      await generateSummary(apiKey);
+    } catch (err) {
+      console.error('Sidebar: Summary generation failed (isolated):', err);
+      summaryStatusElement.textContent = 'Summary generation failed (isolated)';
+      summaryStatusElement.className = 'summary-error';
+      // Error is isolated, transcription continues
+    }
+  }, 0);
 }
 
 function startOverlappingRecording(stream, recorderOptions, apiKey) {
@@ -490,6 +533,7 @@ async function transcribeAudio(blob, apiKey) {
 async function generateSummary(apiKey) {
   if (allTranscripts.length === 0) return;
   
+  // Wrap entire function in try-catch for maximum isolation
   try {
     summaryStatusElement.textContent = 'Generating summary...';
     summaryStatusElement.className = 'summary-loading';
@@ -526,6 +570,10 @@ async function generateSummary(apiKey) {
     
     console.log('Sidebar: Generating summary for', textToSummarize.length, 'characters, target length:', currentSummaryWordCount, 'words');
     
+    // Add fetch timeout and abort controller for reliability
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+    
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -546,8 +594,11 @@ async function generateSummary(apiKey) {
         ],
         max_tokens: Math.min(Math.round(currentSummaryWordCount * 1.3), 1000), // Allow some flexibility in token limit
         temperature: 0.3
-      })
+      }),
+      signal: controller.signal
     });
+    
+    clearTimeout(timeoutId);
     
     if (!response.ok) {
       let errorText = '';
@@ -559,7 +610,7 @@ async function generateSummary(apiKey) {
       }
       
       console.error('Sidebar: Summary generation error', response.status, errorText);
-      summaryStatusElement.textContent = `Summary error: ${response.status}`;
+      summaryStatusElement.textContent = `Summary error: ${response.status} (isolated)`;
       summaryStatusElement.className = 'summary-error';
       return;
     }
@@ -576,20 +627,25 @@ async function generateSummary(apiKey) {
       lastSummaryTime = Date.now();
     } else {
       console.error('Sidebar: No summary content received');
-      summaryStatusElement.textContent = 'Summary generation failed';
+      summaryStatusElement.textContent = 'Summary generation failed (isolated)';
       summaryStatusElement.className = 'summary-error';
     }
     
   } catch (err) {
-    console.error('Sidebar: Summary generation failed:', err);
-    summaryStatusElement.textContent = 'Summary generation failed';
+    console.error('Sidebar: Summary generation failed (isolated):', err);
+    summaryStatusElement.textContent = 'Summary generation failed (isolated)';
     summaryStatusElement.className = 'summary-error';
+    // Error is completely isolated - transcription continues unaffected
   }
 }
 
 function updateSummary(summaryText) {
-  summaryContainer.innerHTML = summaryText;
-  console.log('Sidebar: Updated summary:', summaryText);
+  try {
+    summaryContainer.innerHTML = summaryText;
+    console.log('Sidebar: Updated summary:', summaryText);
+  } catch (err) {
+    console.error('Sidebar: Error updating summary display (isolated):', err);
+  }
 }
 
 /**
@@ -667,16 +723,20 @@ function appendTranscript(text) {
     return;
   }
   
-  // Add to all transcripts for summary generation
-  allTranscripts.push(cleanedText);
-  
-  // Update summary status to show progress
-  if (allTranscripts.length === 1) {
-    summaryStatusElement.textContent = 'Collecting transcripts...';
-  } else {
-    const timeUntilNextSummary = Math.max(0, summaryIntervalMs - (Date.now() - lastSummaryTime));
-    const secondsRemaining = Math.ceil(timeUntilNextSummary / 1000);
-    summaryStatusElement.textContent = `Next summary in ${secondsRemaining}s`;
+  // Add to all transcripts for summary generation (with error isolation)
+  try {
+    allTranscripts.push(cleanedText);
+    
+    // Update summary status to show progress
+    if (allTranscripts.length === 1) {
+      summaryStatusElement.textContent = 'Collecting transcripts...';
+    } else {
+      const timeUntilNextSummary = Math.max(0, summaryIntervalMs - (Date.now() - lastSummaryTime));
+      const secondsRemaining = Math.ceil(timeUntilNextSummary / 1000);
+      summaryStatusElement.textContent = `Next summary in ${secondsRemaining}s`;
+    }
+  } catch (err) {
+    console.error('Sidebar: Error updating summary status (isolated):', err);
   }
   
   // Add timestamp
