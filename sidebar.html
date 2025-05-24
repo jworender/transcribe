@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Audio Transcriber</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      background: #ffffff;
+    }
+    #controls {
+      padding: 16px;
+      background: #f8f9fa;
+      border-bottom: 1px solid #e9ecef;
+      flex-shrink: 0;
+    }
+    #transcript {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      background: #ffffff;
+    }
+    #transcript p {
+      margin: 0 0 12px 0;
+      padding: 8px 12px;
+      background: #f8f9fa;
+      border-radius: 8px;
+      line-height: 1.4;
+      word-wrap: break-word;
+    }
+    #transcript p:last-child {
+      margin-bottom: 0;
+    }
+    #start-stop {
+      padding: 10px 20px;
+      font-size: 14px;
+      background: #007bff;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    #start-stop:hover {
+      background: #0056b3;
+    }
+    #start-stop:active {
+      background: #004085;
+    }
+    #status {
+      margin-left: 12px;
+      color: #6c757d;
+      font-size: 13px;
+      vertical-align: middle;
+      font-weight: 500;
+    }
+    .recording #start-stop {
+      background: #dc3545;
+    }
+    .recording #start-stop:hover {
+      background: #c82333;
+    }
+  </style>
+</head>
+<body>
+  <!-- Hidden audio element to play back captured tab audio -->
+  <audio id="player" autoplay style="display:none;"></audio>
+  <div id="controls">
+    <button id="start-stop">Start</button>
+    <span id="status"></span>
+  </div>
+  <div id="transcript"></div>
+  <script src="sidebar.js"></script>
+</body>
+</html>

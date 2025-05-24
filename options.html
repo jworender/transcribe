@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Audio Transcriber Options</title>
+  <style>
+    body { font-family: sans-serif; padding: 10px; }
+    label { display: block; margin: 10px 0; }
+    input { width: 100%; padding: 5px; }
+    button { padding: 5px 10px; }
+    #status { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Audio Transcriber Options</h1>
+  <form id="api-key-form">
+    <label>
+      OpenAI API Key:
+      <input type="password" id="api-key-input" placeholder="sk-...">
+    </label>
+    <button type="submit">Save</button>
+  </form>
+  <div id="status"></div>
+  <script src="options.js"></script>
+</body>
+</html>
