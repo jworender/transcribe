@@ -205,8 +205,9 @@ function startRecordingWithStream(stream, apiKey) {
   // Update summary status
   summaryStatusElement.textContent = 'Recording started...';
   
-  // Start summary timer with error isolation
-  startSummaryTimer(apiKey);
+  // TEMPORARILY DISABLE SUMMARY TO TEST TRANSCRIPTION STABILITY
+  // startSummaryTimer(apiKey);
+  summaryStatusElement.textContent = 'Summary disabled for testing connection stability';
   
   // Start overlapping recording cycles for continuous audio
   startOverlappingRecording(stream, recorderOptions, apiKey);
@@ -727,14 +728,8 @@ function appendTranscript(text) {
   try {
     allTranscripts.push(cleanedText);
     
-    // Update summary status to show progress
-    if (allTranscripts.length === 1) {
-      summaryStatusElement.textContent = 'Collecting transcripts...';
-    } else {
-      const timeUntilNextSummary = Math.max(0, summaryIntervalMs - (Date.now() - lastSummaryTime));
-      const secondsRemaining = Math.ceil(timeUntilNextSummary / 1000);
-      summaryStatusElement.textContent = `Next summary in ${secondsRemaining}s`;
-    }
+    // Update summary status to show progress (but summary is disabled for testing)
+    summaryStatusElement.textContent = 'Summary disabled for testing connection stability';
   } catch (err) {
     console.error('Sidebar: Error updating summary status (isolated):', err);
   }
