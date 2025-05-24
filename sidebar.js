@@ -10,6 +10,12 @@ let recentTranscripts = [];
 const maxRecentTranscripts = 3;
 let lastFullTranscript = ''; // Store the complete last transcript for overlap detection
 
+// Summary functionality
+let allTranscripts = []; // Store all transcripts for summary generation
+let summaryTimer = null;
+let lastSummaryTime = 0;
+const summaryIntervalMs = 30000; // 30 seconds
+
 // Silence detection parameters
 const silenceThreshold = 0.01;
 const silenceTimeoutMs = 3000;
@@ -26,6 +32,8 @@ const startStopButton = document.getElementById('start-stop');
 const statusElement = document.getElementById('status');
 statusElement.textContent = 'Ready - Click the extension icon to grant permissions';
 const transcriptContainer = document.getElementById('transcript');
+const summaryContainer = document.getElementById('summary');
+const summaryStatusElement = document.getElementById('summary-status');
 
 // Connect to background script
 function connectToBackground() {
@@ -163,9 +171,30 @@ function startRecordingWithStream(stream, apiKey) {
   // Clear recent transcripts when starting
   recentTranscripts = [];
   lastFullTranscript = '';
+  allTranscripts = [];
+  lastSummaryTime = Date.now();
+  
+  // Update summary status
+  summaryStatusElement.textContent = 'Recording started...';
+  
+  // Start summary timer
+  startSummaryTimer(apiKey);
   
   // Start overlapping recording cycles for continuous audio
   startOverlappingRecording(stream, recorderOptions, apiKey);
+}
+
+function startSummaryTimer(apiKey) {
+  // Clear any existing timer
+  if (summaryTimer) {
+    clearInterval(summaryTimer);
+  }
+  
+  summaryTimer = setInterval(() => {
+    if (isRecording && allTranscripts.length > 0) {
+      generateSummary(apiKey);
+    }
+  }, summaryIntervalMs);
 }
 
 function startOverlappingRecording(stream, recorderOptions, apiKey) {
@@ -230,6 +259,12 @@ function startRecordingCycle(stream, recorderOptions, apiKey, cycleId) {
 function stopLocalCapture() {
   isRecording = false;
   
+  // Stop summary timer
+  if (summaryTimer) {
+    clearInterval(summaryTimer);
+    summaryTimer = null;
+  }
+  
   // Stop all active recorders
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     mediaRecorder.stop();
@@ -254,6 +289,9 @@ function stopLocalCapture() {
   recordingCycles = [];
   startStopButton.textContent = 'Start';
   statusElement.textContent = 'Stopped';
+  
+  // Update summary status
+  summaryStatusElement.textContent = 'Recording stopped';
   
   // Clear recent transcripts when stopping
   recentTranscripts = [];
@@ -440,6 +478,88 @@ async function transcribeAudio(blob, apiKey) {
   }
 }
 
+// Generate summary using OpenAI GPT
+async function generateSummary(apiKey) {
+  if (allTranscripts.length === 0) return;
+  
+  try {
+    summaryStatusElement.textContent = 'Generating summary...';
+    summaryStatusElement.className = 'summary-loading';
+    
+    // Combine all transcripts into a single text
+    const allText = allTranscripts.join(' ');
+    
+    // Limit text length to avoid token limits (approximately 3000 tokens)
+    const maxLength = 12000; // roughly 3000 tokens
+    const textToSummarize = allText.length > maxLength ? 
+      allText.slice(-maxLength) : allText;
+    
+    console.log('Sidebar: Generating summary for', textToSummarize.length, 'characters');
+    
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-3.5-turbo',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a helpful assistant that creates concise, informative summaries of audio transcriptions. Focus on key points, main topics, and important information. Keep the summary clear and well-organized.'
+          },
+          {
+            role: 'user',
+            content: `Please provide a concise summary of the following audio transcription:\n\n${textToSummarize}`
+          }
+        ],
+        max_tokens: 300,
+        temperature: 0.3
+      })
+    });
+    
+    if (!response.ok) {
+      let errorText = '';
+      try {
+        const errorJson = await response.json();
+        errorText = errorJson.error?.message || JSON.stringify(errorJson);
+      } catch (e) {
+        errorText = await response.text();
+      }
+      
+      console.error('Sidebar: Summary generation error', response.status, errorText);
+      summaryStatusElement.textContent = `Summary error: ${response.status}`;
+      summaryStatusElement.className = 'summary-error';
+      return;
+    }
+    
+    const result = await response.json();
+    const summary = result.choices?.[0]?.message?.content;
+    
+    if (summary) {
+      updateSummary(summary);
+      const now = new Date();
+      summaryStatusElement.textContent = `Updated ${now.toLocaleTimeString()}`;
+      summaryStatusElement.className = '';
+    } else {
+      console.error('Sidebar: No summary content received');
+      summaryStatusElement.textContent = 'Summary generation failed';
+      summaryStatusElement.className = 'summary-error';
+    }
+    
+  } catch (err) {
+    console.error('Sidebar: Summary generation failed:', err);
+    summaryStatusElement.textContent = 'Summary generation failed';
+    summaryStatusElement.className = 'summary-error';
+  }
+}
+
+function updateSummary(summaryText) {
+  summaryContainer.innerHTML = summaryText;
+  console.log('Sidebar: Updated summary:', summaryText);
+}
+
 /**
  * Remove overlapping text from new transcript using progressive character comparison
  */
@@ -513,6 +633,18 @@ function appendTranscript(text) {
   if (!cleanedText) {
     console.log('Sidebar: No new content after overlap removal');
     return;
+  }
+  
+  // Add to all transcripts for summary generation
+  allTranscripts.push(cleanedText);
+  
+  // Update summary status to show progress
+  if (allTranscripts.length === 1) {
+    summaryStatusElement.textContent = 'Collecting transcripts...';
+  } else {
+    const timeUntilNextSummary = Math.max(0, summaryIntervalMs - (Date.now() - lastSummaryTime));
+    const secondsRemaining = Math.ceil(timeUntilNextSummary / 1000);
+    summaryStatusElement.textContent = `Next summary in ${secondsRemaining}s`;
   }
   
   // Add timestamp
