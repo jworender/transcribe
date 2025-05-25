@@ -14,7 +14,9 @@ let lastFullTranscript = ''; // Store the complete last transcript for overlap d
 let allTranscripts = []; // Store all transcripts for summary generation
 let summaryTimer = null;
 let lastSummaryTime = 0;
-const summaryIntervalMs = 30000; // 30 seconds
+const firstSummaryDelayMs = 120000; // 2 minutes for first summary
+const summaryIntervalMs = 30000; // 30 seconds for subsequent summaries
+let isFirstSummary = true; // Track if we haven't generated the first summary yet
 let baseSummaryWordCount = 200; // Starting summary length
 let lastTranscriptLength = 0; // Track transcript growth
 let currentSummaryWordCount = 200; // Dynamic summary length
@@ -32,9 +34,16 @@ let dataArray = null;
 // Overlapping recording for continuous audio
 let recordingCycles = [];
 
+// Connection monitoring and resilience
+let connectionCheckInterval = null;
+let lastApiKey = null;
+let independentMode = false; // Track if we're running without background connection
+let keepAliveInterval = null; // Keep extension alive
+let lastTranscriptionTime = 0; // Track transcription activity
+
 const startStopButton = document.getElementById('start-stop');
 const statusElement = document.getElementById('status');
-statusElement.textContent = 'Ready - Click the extension icon to grant permissions';
+statusElement.textContent = 'Click the extension icon first, then click Start';
 const transcriptContainer = document.getElementById('transcript');
 const summaryContainer = document.getElementById('summary');
 const summaryStatusElement = document.getElementById('summary-status');
@@ -59,38 +68,141 @@ window.addEventListener('unhandledrejection', (event) => {
   }
 });
 
-// Connect to background script
-function connectToBackground() {
-  backgroundPort = chrome.runtime.connect({ name: "sidebar" });
+// Keep extension alive by preventing service worker suspension
+function startKeepAlive() {
+  if (keepAliveInterval) return;
   
-  backgroundPort.onMessage.addListener((message) => {
-    console.log('Sidebar: Received message from background:', message);
+  keepAliveInterval = setInterval(() => {
+    // Ping chrome storage to keep extension active
+    chrome.storage.local.get(['keepAlive'], () => {
+      console.log('Sidebar: Keep-alive ping');
+    });
     
-    switch (message.type) {
-      case 'permissionGranted':
-        console.log('Sidebar: Permission granted for tab:', message.tabId);
-        statusElement.textContent = 'Permission granted - Ready to record';
-        break;
-        
-      case 'permissionStatusUpdate':
-        console.log('Sidebar: Permission status updated, hasPermission:', message.hasPermission);
-        if (message.hasPermission) {
-          statusElement.textContent = 'Permission granted - Ready to record';
-        }
-        break;
-        
-      case 'error':
-        handleError(message.message);
-        break;
+    // Also try to reconnect background if disconnected during recording
+    if (isRecording && !backgroundPort) {
+      console.log('Sidebar: Background disconnected during recording, attempting reconnection...');
+      connectToBackground();
     }
-  });
+  }, 25000); // Every 25 seconds, before the 30-second timeout
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+}
+
+// Enhanced connection monitoring
+function startConnectionMonitoring() {
+  if (connectionCheckInterval) return;
   
-  backgroundPort.onDisconnect.addListener(() => {
-    console.log('Sidebar: Disconnected from background');
-    backgroundPort = null;
-    stopLocalCapture();
-    statusElement.textContent = 'Connection lost - Refresh to reconnect';
-  });
+  connectionCheckInterval = setInterval(() => {
+    // Check if we're supposed to be recording but haven't had transcription activity
+    if (isRecording && Date.now() - lastTranscriptionTime > 15000) {
+      console.log('Sidebar: No transcription activity for 15 seconds, checking connection...');
+      
+      // Try to test the connection
+      if (backgroundPort) {
+        try {
+          backgroundPort.postMessage({ action: 'ping' });
+        } catch (err) {
+          console.log('Sidebar: Background port failed, switching to independent mode');
+          switchToIndependentMode();
+        }
+      } else {
+        console.log('Sidebar: No background port, running in independent mode');
+        switchToIndependentMode();
+      }
+    }
+  }, 10000); // Check every 10 seconds
+}
+
+function stopConnectionMonitoring() {
+  if (connectionCheckInterval) {
+    clearInterval(connectionCheckInterval);
+    connectionCheckInterval = null;
+  }
+}
+
+// Switch to independent transcription mode
+function switchToIndependentMode() {
+  console.log('Sidebar: Switching to independent transcription mode');
+  independentMode = true;
+  statusElement.textContent = 'Recording in independent mode (connection lost)';
+  
+  // Continue transcription without background script
+  if (isRecording && currentStream && lastApiKey) {
+    console.log('Sidebar: Maintaining transcription independently');
+    // The recording cycles should continue running
+  }
+}
+
+// Connect to background script with enhanced reconnection
+function connectToBackground() {
+  try {
+    if (backgroundPort) {
+      backgroundPort.disconnect();
+    }
+    
+    backgroundPort = chrome.runtime.connect({ name: "sidebar" });
+    console.log('Sidebar: Connected to background script');
+    independentMode = false;
+    
+    backgroundPort.onMessage.addListener((message) => {
+      console.log('Sidebar: Received message from background:', message);
+      
+      switch (message.type) {
+        case 'permissionGranted':
+          console.log('Sidebar: Permission granted for tab:', message.tabId);
+          statusElement.textContent = 'Permission granted - Starting capture...';
+          // Actually start the capture when permission is granted
+          if (lastApiKey) {
+            startLocalCapture(lastApiKey);
+          }
+          break;
+          
+        case 'permissionStatusUpdate':
+          console.log('Sidebar: Permission status updated, hasPermission:', message.hasPermission);
+          if (message.hasPermission) {
+            statusElement.textContent = 'Permission granted - Ready to record';
+          }
+          break;
+          
+        case 'error':
+          handleError(message.message);
+          break;
+          
+        case 'pong':
+          console.log('Sidebar: Background connection confirmed');
+          break;
+      }
+    });
+    
+    backgroundPort.onDisconnect.addListener(() => {
+      console.log('Sidebar: Disconnected from background');
+      backgroundPort = null;
+      
+      if (isRecording) {
+        console.log('Sidebar: Was recording, switching to independent mode...');
+        switchToIndependentMode();
+      } else {
+        statusElement.textContent = 'Click the extension icon first, then click Start';
+        // Attempt reconnection after a short delay
+        setTimeout(() => {
+          if (!backgroundPort && !independentMode) {
+            connectToBackground();
+          }
+        }, 2000);
+      }
+    });
+    
+  } catch (err) {
+    console.error('Sidebar: Failed to connect to background:', err);
+    if (isRecording) {
+      switchToIndependentMode();
+    }
+  }
 }
 
 // Connect when sidebar loads
@@ -99,15 +211,12 @@ connectToBackground();
 startStopButton.addEventListener('click', () => {
   console.log('StartStop button clicked, isRecording=', isRecording);
   
-  if (!backgroundPort) {
-    statusElement.textContent = 'Connection error - Try refreshing the page';
-    return;
-  }
-  
   if (isRecording) {
     // Stop recording
     stopLocalCapture();
-    backgroundPort.postMessage({ action: 'stopCapture' });
+    if (backgroundPort) {
+      backgroundPort.postMessage({ action: 'stopCapture' });
+    }
     return;
   }
 
@@ -119,6 +228,7 @@ startStopButton.addEventListener('click', () => {
       return;
     }
 
+    lastApiKey = apiKey; // Store for independent mode
     statusElement.textContent = 'Requesting permission and starting capture...';
     
     // First try direct capture
@@ -126,16 +236,24 @@ startStopButton.addEventListener('click', () => {
       if (chrome.runtime.lastError) {
         console.error('Sidebar: Direct tab capture failed:', chrome.runtime.lastError);
         
-        // If direct capture fails, request permission from background
-        console.log('Sidebar: Requesting permission from background');
-        statusElement.textContent = 'Requesting permission from background...';
-        backgroundPort.postMessage({ action: 'requestPermission', apiKey: apiKey });
+        // If direct capture fails, try background if available
+        if (backgroundPort) {
+          console.log('Sidebar: Requesting permission from background');
+          statusElement.textContent = 'Requesting permission from background...';
+          backgroundPort.postMessage({ action: 'requestPermission', apiKey: apiKey });
+        } else {
+          handleError('No permission and background unavailable - Click the extension icon first');
+        }
         return;
       }
       
       if (!stream) {
-        console.log('Sidebar: No stream from direct capture, requesting permission from background');
-        backgroundPort.postMessage({ action: 'requestPermission', apiKey: apiKey });
+        console.log('Sidebar: No stream from direct capture');
+        if (backgroundPort) {
+          backgroundPort.postMessage({ action: 'requestPermission', apiKey: apiKey });
+        } else {
+          handleError('No audio stream available');
+        }
         return;
       }
       
@@ -169,6 +287,7 @@ function startLocalCapture(apiKey) {
 
 function startRecordingWithStream(stream, apiKey) {
   currentStream = stream;
+  lastApiKey = apiKey;
   
   // Set up audio context and passthrough to maintain browser audio
   setupAudioPassthrough(stream);
@@ -187,7 +306,11 @@ function startRecordingWithStream(stream, apiKey) {
   
   isRecording = true;
   startStopButton.textContent = 'Stop';
-  statusElement.textContent = 'Recording and transcribing... (Audio playback maintained)';
+  statusElement.textContent = 'Recording and transcribing...';
+  
+  // Start stability measures
+  startKeepAlive();
+  startConnectionMonitoring();
   
   // Start silence monitoring
   startSilenceMonitoring();
@@ -197,56 +320,19 @@ function startRecordingWithStream(stream, apiKey) {
   lastFullTranscript = '';
   allTranscripts = [];
   lastSummaryTime = Date.now();
+  lastTranscriptionTime = Date.now();
+  isFirstSummary = true; // Reset for new recording session
   
   // Reset summary tracking variables
   lastTranscriptLength = 0;
   currentSummaryWordCount = baseSummaryWordCount;
   
-  // Update summary status
-  summaryStatusElement.textContent = 'Recording started...';
-  
-  // TEMPORARILY DISABLE SUMMARY TO TEST TRANSCRIPTION STABILITY
-  // startSummaryTimer(apiKey);
-  summaryStatusElement.textContent = 'Summary disabled for testing connection stability';
+  // Update summary status and start summary timer
+  summaryStatusElement.textContent = 'First summary in 2 minutes...';
+  startSummaryTimer(apiKey);
   
   // Start overlapping recording cycles for continuous audio
   startOverlappingRecording(stream, recorderOptions, apiKey);
-}
-
-function startSummaryTimer(apiKey) {
-  // Clear any existing timer
-  if (summaryTimer) {
-    clearInterval(summaryTimer);
-  }
-  
-  summaryTimer = setInterval(() => {
-    try {
-      if (isRecording && allTranscripts.length > 0) {
-        // Run summary generation in isolated async context
-        generateSummaryAsync(apiKey);
-      }
-    } catch (err) {
-      console.error('Sidebar: Summary timer error (isolated):', err);
-      // Don't let summary errors affect transcription
-      summaryStatusElement.textContent = 'Summary error (isolated)';
-      summaryStatusElement.className = 'summary-error';
-    }
-  }, summaryIntervalMs);
-}
-
-// Isolated async summary generation to prevent blocking main thread
-async function generateSummaryAsync(apiKey) {
-  // Use setTimeout to ensure this runs in next tick, completely isolated
-  setTimeout(async () => {
-    try {
-      await generateSummary(apiKey);
-    } catch (err) {
-      console.error('Sidebar: Summary generation failed (isolated):', err);
-      summaryStatusElement.textContent = 'Summary generation failed (isolated)';
-      summaryStatusElement.className = 'summary-error';
-      // Error is isolated, transcription continues
-    }
-  }, 0);
 }
 
 function startOverlappingRecording(stream, recorderOptions, apiKey) {
@@ -275,6 +361,7 @@ function startRecordingCycle(stream, recorderOptions, apiKey, cycleId) {
       // Only transcribe if there was recent audio activity
       if (Date.now() - lastAudioTime < silenceTimeoutMs) {
         transcribeAudio(event.data, apiKey);
+        lastTranscriptionTime = Date.now(); // Update activity tracking
       } else {
         console.log(`Sidebar: Cycle ${cycleId} - Skipping transcription due to silence`);
       }
@@ -310,12 +397,14 @@ function startRecordingCycle(stream, recorderOptions, apiKey, cycleId) {
 
 function stopLocalCapture() {
   isRecording = false;
+  independentMode = false;
+  
+  // Stop stability measures
+  stopKeepAlive();
+  stopConnectionMonitoring();
   
   // Stop summary timer
-  if (summaryTimer) {
-    clearInterval(summaryTimer);
-    summaryTimer = null;
-  }
+  stopSummaryTimer();
   
   // Stop all active recorders
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
@@ -339,8 +428,9 @@ function stopLocalCapture() {
   analyser = null;
   audioPlaybackNodes = null;
   recordingCycles = [];
+  lastApiKey = null;
   startStopButton.textContent = 'Start';
-  statusElement.textContent = 'Stopped';
+  statusElement.textContent = 'Click the extension icon first, then click Start';
   
   // Update summary status
   summaryStatusElement.textContent = 'Recording stopped';
@@ -348,6 +438,118 @@ function stopLocalCapture() {
   // Clear recent transcripts when stopping
   recentTranscripts = [];
   lastFullTranscript = '';
+}
+
+// Start summary timer with custom timing for first vs subsequent summaries
+function startSummaryTimer(apiKey) {
+  if (summaryTimer) {
+    clearTimeout(summaryTimer);
+  }
+  
+  const delay = isFirstSummary ? firstSummaryDelayMs : summaryIntervalMs;
+  console.log(`Sidebar: Starting summary timer, delay: ${delay}ms, isFirstSummary: ${isFirstSummary}`);
+  
+  summaryTimer = setTimeout(() => {
+    if (isRecording && allTranscripts.length > 0) {
+      generateSummary(apiKey);
+    }
+  }, delay);
+}
+
+function stopSummaryTimer() {
+  if (summaryTimer) {
+    clearTimeout(summaryTimer);
+    summaryTimer = null;
+  }
+}
+
+// Generate live summary of transcripts
+async function generateSummary(apiKey) {
+  if (!isRecording || allTranscripts.length === 0) return;
+  
+  try {
+    console.log('Sidebar: Generating summary from', allTranscripts.length, 'transcript segments');
+    
+    // Update status
+    if (isFirstSummary) {
+      summaryStatusElement.textContent = 'Generating first summary...';
+    } else {
+      summaryStatusElement.textContent = 'Updating summary...';
+    }
+    
+    // Combine all transcripts
+    const fullTranscript = allTranscripts.join(' ');
+    const transcriptWordCount = fullTranscript.split(/\s+/).length;
+    
+    // Adjust summary length based on transcript growth
+    if (transcriptWordCount > minTranscriptWordsForGrowth && transcriptWordCount > lastTranscriptLength * 1.5) {
+      currentSummaryWordCount = Math.min(baseSummaryWordCount + Math.floor((transcriptWordCount - minTranscriptWordsForGrowth) / 100) * 50, 500);
+      console.log(`Sidebar: Adjusted summary length to ${currentSummaryWordCount} words based on transcript growth`);
+    }
+    lastTranscriptLength = transcriptWordCount;
+    
+    // Create summary prompt
+    const summaryPrompt = `Please provide a concise summary of the following transcript in approximately ${currentSummaryWordCount} words. Focus on key topics, main points, and important information:\n\n${fullTranscript}`;
+    
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-3.5-turbo',
+        messages: [
+          {
+            role: 'user',
+            content: summaryPrompt
+          }
+        ],
+        max_tokens: Math.floor(currentSummaryWordCount * 1.5), // Allow some flexibility
+        temperature: 0.3
+      })
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Summary API error: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    const summary = data.choices[0].message.content.trim();
+    
+    // Update summary container
+    const timestamp = new Date().toLocaleTimeString();
+    summaryContainer.innerHTML = `
+      <div style="color: #666; font-size: 0.8em; margin-bottom: 8px;">
+        [Updated: ${timestamp}] - ${transcriptWordCount} words transcribed
+      </div>
+      <div style="line-height: 1.4;">${summary}</div>
+    `;
+    
+    console.log('Sidebar: Summary generated successfully');
+    
+    // Update status and schedule next summary
+    if (isFirstSummary) {
+      summaryStatusElement.textContent = 'Summary generated! Next update in 30 seconds...';
+      isFirstSummary = false;
+    } else {
+      summaryStatusElement.textContent = 'Summary updated! Next update in 30 seconds...';
+    }
+    
+    // Schedule next summary
+    if (isRecording) {
+      startSummaryTimer(apiKey);
+    }
+    
+  } catch (err) {
+    console.error('Sidebar: Summary generation failed:', err);
+    summaryStatusElement.textContent = 'Summary generation failed - continuing transcription...';
+    
+    // Still schedule next attempt
+    if (isRecording) {
+      startSummaryTimer(apiKey);
+    }
+  }
 }
 
 function setupAudioPassthrough(stream) {
@@ -442,8 +644,8 @@ function handleError(errorMessage) {
   startStopButton.textContent = 'Start';
   
   // Provide helpful error messages
-  if (errorMessage.includes('Extension has not been invoked') || errorMessage.includes('activeTab')) {
-    statusElement.textContent = 'Permission denied. Try: 1) Close sidebar 2) Click extension icon 3) Try again';
+  if (errorMessage.includes('Extension has not been invoked') || errorMessage.includes('activeTab') || errorMessage.includes('No permission')) {
+    statusElement.textContent = 'PERMISSION NEEDED: Click the extension icon first, then try Start again';
   } else if (errorMessage.includes('Chrome pages cannot be captured')) {
     statusElement.textContent = 'Cannot capture from Chrome pages. Go to YouTube, news sites, etc.';
   } else if (errorMessage.includes('No audio')) {
@@ -453,7 +655,7 @@ function handleError(errorMessage) {
   }
 }
 
-// Audio transcription with complete files from overlapping recording
+// Enhanced audio transcription with connection resilience
 async function transcribeAudio(blob, apiKey) {
   console.log('Sidebar: Transcribing complete audio file, size:', blob.size, 'type:', blob.type);
   
@@ -485,13 +687,20 @@ async function transcribeAudio(blob, apiKey) {
     
     console.log('Sidebar: Sending complete file to OpenAI, file name:', audioFile.name, 'file type:', audioFile.type, 'size:', audioFile.size);
     
+    // Add timeout and abort controller for better reliability
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+    
     const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
       headers: { 
         'Authorization': 'Bearer ' + apiKey 
       },
-      body: formData
+      body: formData,
+      signal: controller.signal
     });
+    
+    clearTimeout(timeoutId);
     
     if (!response.ok) {
       let errorText = '';
@@ -509,143 +718,39 @@ async function transcribeAudio(blob, apiKey) {
         statusElement.textContent = 'Transcription format issue - continuing...';
         setTimeout(() => {
           if (statusElement.textContent.includes('format issue')) {
-            statusElement.textContent = 'Recording and transcribing... (Audio playback maintained)';
+            if (independentMode) {
+              statusElement.textContent = 'Recording in independent mode (connection lost)';
+            } else {
+              statusElement.textContent = 'Recording and transcribing...';
+            }
           }
         }, 3000);
         return;
       }
       
-      // For other errors, show to user
-      statusElement.textContent = `Transcription Error ${response.status}`;
+      // For other errors, show to user but don't stop
+      console.error('Sidebar: Transcription API error, continuing...');
       return;
     }
     
     const transcription = await response.text();
     if (transcription && transcription.trim()) {
       appendTranscript(transcription.trim());
-    }
-  } catch (err) {
-    console.error('Sidebar: Transcription failed:', err);
-    console.log('Sidebar: Continuing despite transcription error');
-  }
-}
-
-// Generate summary using OpenAI GPT with proportional growth after threshold
-async function generateSummary(apiKey) {
-  if (allTranscripts.length === 0) return;
-  
-  // Wrap entire function in try-catch for maximum isolation
-  try {
-    summaryStatusElement.textContent = 'Generating summary...';
-    summaryStatusElement.className = 'summary-loading';
-    
-    // Combine all transcripts into a single text
-    const allText = allTranscripts.join(' ');
-    const currentTranscriptWordCount = allText.split(/\s+/).length;
-    
-    // Only allow proportional growth after transcript exceeds the minimum threshold
-    if (currentTranscriptWordCount >= minTranscriptWordsForGrowth && lastTranscriptLength > 0) {
-      const currentTranscriptLength = allText.length;
-      const growthRatio = currentTranscriptLength / lastTranscriptLength;
-      currentSummaryWordCount = Math.round(currentSummaryWordCount * growthRatio);
       
-      // Cap at reasonable maximum to avoid token limits
-      currentSummaryWordCount = Math.min(currentSummaryWordCount, 800);
-      
-      console.log(`Sidebar: Transcript has ${currentTranscriptWordCount} words (threshold: ${minTranscriptWordsForGrowth})`);
-      console.log(`Sidebar: Transcript grew from ${lastTranscriptLength} to ${currentTranscriptLength} chars (${(growthRatio * 100).toFixed(1)}% growth)`);
-      console.log(`Sidebar: Summary target updated to ${currentSummaryWordCount} words`);
-    } else {
-      // Keep base summary length until threshold is reached
-      currentSummaryWordCount = baseSummaryWordCount;
-      console.log(`Sidebar: Transcript has ${currentTranscriptWordCount} words (below ${minTranscriptWordsForGrowth} threshold), keeping ${baseSummaryWordCount}-word summary`);
-    }
-    
-    // Update tracking variable for next iteration
-    lastTranscriptLength = allText.length;
-    
-    // Limit text length to avoid token limits (approximately 3000 tokens)
-    const maxLength = 12000; // roughly 3000 tokens
-    const textToSummarize = allText.length > maxLength ? 
-      allText.slice(-maxLength) : allText;
-    
-    console.log('Sidebar: Generating summary for', textToSummarize.length, 'characters, target length:', currentSummaryWordCount, 'words');
-    
-    // Add fetch timeout and abort controller for reliability
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
-    
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + apiKey,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-3.5-turbo',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a helpful assistant that creates comprehensive summaries of audio transcriptions. Focus on key points, main topics, and important information. Keep the summary clear and well-organized. Target approximately ${currentSummaryWordCount} words in your summary.`
-          },
-          {
-            role: 'user',
-            content: `Please provide a comprehensive summary of approximately ${currentSummaryWordCount} words for the following audio transcription:\n\n${textToSummarize}`
-          }
-        ],
-        max_tokens: Math.min(Math.round(currentSummaryWordCount * 1.3), 1000), // Allow some flexibility in token limit
-        temperature: 0.3
-      }),
-      signal: controller.signal
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) {
-      let errorText = '';
-      try {
-        const errorJson = await response.json();
-        errorText = errorJson.error?.message || JSON.stringify(errorJson);
-      } catch (e) {
-        errorText = await response.text();
+      // Update status to show we're actively transcribing
+      if (independentMode) {
+        statusElement.textContent = 'Recording in independent mode (transcribing)';
+      } else {
+        statusElement.textContent = 'Recording and transcribing...';
       }
-      
-      console.error('Sidebar: Summary generation error', response.status, errorText);
-      summaryStatusElement.textContent = `Summary error: ${response.status} (isolated)`;
-      summaryStatusElement.className = 'summary-error';
-      return;
     }
-    
-    const result = await response.json();
-    const summary = result.choices?.[0]?.message?.content;
-    
-    if (summary) {
-      updateSummary(summary);
-      const now = new Date();
-      const wordCount = summary.split(/\s+/).length;
-      summaryStatusElement.textContent = `Updated ${now.toLocaleTimeString()} (${wordCount} words)`;
-      summaryStatusElement.className = '';
-      lastSummaryTime = Date.now();
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      console.log('Sidebar: Transcription request timed out, continuing...');
     } else {
-      console.error('Sidebar: No summary content received');
-      summaryStatusElement.textContent = 'Summary generation failed (isolated)';
-      summaryStatusElement.className = 'summary-error';
+      console.error('Sidebar: Transcription failed:', err);
     }
-    
-  } catch (err) {
-    console.error('Sidebar: Summary generation failed (isolated):', err);
-    summaryStatusElement.textContent = 'Summary generation failed (isolated)';
-    summaryStatusElement.className = 'summary-error';
-    // Error is completely isolated - transcription continues unaffected
-  }
-}
-
-function updateSummary(summaryText) {
-  try {
-    summaryContainer.innerHTML = summaryText;
-    console.log('Sidebar: Updated summary:', summaryText);
-  } catch (err) {
-    console.error('Sidebar: Error updating summary display (isolated):', err);
+    console.log('Sidebar: Continuing despite transcription error');
   }
 }
 
@@ -724,14 +829,11 @@ function appendTranscript(text) {
     return;
   }
   
-  // Add to all transcripts for summary generation (with error isolation)
+  // Add to all transcripts for summary generation
   try {
     allTranscripts.push(cleanedText);
-    
-    // Update summary status to show progress (but summary is disabled for testing)
-    summaryStatusElement.textContent = 'Summary disabled for testing connection stability';
   } catch (err) {
-    console.error('Sidebar: Error updating summary status (isolated):', err);
+    console.error('Sidebar: Error updating transcripts array (isolated):', err);
   }
   
   // Add timestamp
