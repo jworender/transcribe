@@ -3,6 +3,11 @@ let isRecording = false;
 let backgroundPort = null;
 let mediaRecorder = null;
 let currentStream = null;
+let currentSettings = {
+  apiKey: null,
+  llmEndpoint: 'https://api.openai.com/v1/chat/completions',
+  whisperEndpoint: 'https://api.openai.com/v1/audio/transcriptions'
+};
 let audioPlaybackNodes = null; // For audio passthrough
 
 // Track the last few transcribed texts to prevent immediate duplicates
@@ -168,6 +173,19 @@ function connectToBackground() {
             statusElement.textContent = 'Permission granted - Ready to record';
           }
           break;
+
+        case 'settingsUpdated':
+          console.log('Sidebar: Received settings update from background:', message.settings);
+          if (message.settings) {
+            currentSettings.apiKey = message.settings.apiKey;
+            currentSettings.llmEndpoint = message.settings.llmEndpoint || 'https://api.openai.com/v1/chat/completions';
+            currentSettings.whisperEndpoint = message.settings.whisperEndpoint || 'https://api.openai.com/v1/audio/transcriptions';
+            // Update lastApiKey if currentSettings.apiKey is available, for independent mode
+            if (currentSettings.apiKey) {
+              lastApiKey = currentSettings.apiKey;
+            }
+          }
+          break;
           
         case 'error':
           handleError(message.message);
@@ -220,50 +238,62 @@ startStopButton.addEventListener('click', () => {
     return;
   }
 
-  // Start recording - first check for API key
-  chrome.storage.local.get(['openaiApiKey'], (res) => {
-    const apiKey = res.openaiApiKey;
-    if (!apiKey) {
-      statusElement.textContent = 'Missing OpenAI API key - Click Options to set it';
-      return;
-    }
-
-    lastApiKey = apiKey; // Store for independent mode
-    statusElement.textContent = 'Requesting permission and starting capture...';
-    
-    // First try direct capture
-    chrome.tabCapture.capture({ audio: true, video: false }, (stream) => {
-      if (chrome.runtime.lastError) {
-        console.error('Sidebar: Direct tab capture failed:', chrome.runtime.lastError);
-        
-        // If direct capture fails, try background if available
-        if (backgroundPort) {
-          console.log('Sidebar: Requesting permission from background');
-          statusElement.textContent = 'Requesting permission from background...';
-          backgroundPort.postMessage({ action: 'requestPermission', apiKey: apiKey });
-        } else {
-          handleError('No permission and background unavailable - Click the extension icon first');
-        }
+  // Start recording - first check for API key from currentSettings
+  if (!currentSettings.apiKey) {
+    // Attempt to load from storage if not yet received from background
+    chrome.storage.local.get(['openaiApiKey', 'llmEndpoint', 'whisperEndpoint'], (res) => {
+      currentSettings.apiKey = res.openaiApiKey;
+      currentSettings.llmEndpoint = res.llmEndpoint || 'https://api.openai.com/v1/chat/completions';
+      currentSettings.whisperEndpoint = res.whisperEndpoint || 'https://api.openai.com/v1/audio/transcriptions';
+      
+      if (!currentSettings.apiKey) {
+        statusElement.textContent = 'Missing OpenAI API key - Click Options to set it';
         return;
       }
-      
-      if (!stream) {
-        console.log('Sidebar: No stream from direct capture');
-        if (backgroundPort) {
-          backgroundPort.postMessage({ action: 'requestPermission', apiKey: apiKey });
-        } else {
-          handleError('No audio stream available');
-        }
-        return;
-      }
-      
-      console.log('Sidebar: Direct audio capture successful');
-      startRecordingWithStream(stream, apiKey);
+      lastApiKey = currentSettings.apiKey; // Store for independent mode
+      proceedWithRecording();
     });
-  });
+  } else {
+    lastApiKey = currentSettings.apiKey; // Store for independent mode
+    proceedWithRecording();
+  }
 });
 
-function startLocalCapture(apiKey) {
+function proceedWithRecording() {
+  statusElement.textContent = 'Requesting permission and starting capture...';
+  
+  // First try direct capture
+  chrome.tabCapture.capture({ audio: true, video: false }, (stream) => {
+    if (chrome.runtime.lastError) {
+      console.error('Sidebar: Direct tab capture failed:', chrome.runtime.lastError);
+      
+      // If direct capture fails, try background if available
+      if (backgroundPort) {
+        console.log('Sidebar: Requesting permission from background');
+        statusElement.textContent = 'Requesting permission from background...';
+        backgroundPort.postMessage({ action: 'requestPermission' }); // API key is now managed by currentSettings
+      } else {
+        handleError('No permission and background unavailable - Click the extension icon first');
+      }
+      return;
+    }
+    
+    if (!stream) {
+      console.log('Sidebar: No stream from direct capture');
+      if (backgroundPort) {
+        backgroundPort.postMessage({ action: 'requestPermission' });
+      } else {
+        handleError('No audio stream available');
+      }
+      return;
+    }
+    
+    console.log('Sidebar: Direct audio capture successful');
+    startRecordingWithStream(stream);
+  });
+}
+
+function startLocalCapture() { // API key is now from currentSettings
   // This is called when background confirms permission
   console.log('Sidebar: Starting local capture with confirmed permission');
   statusElement.textContent = 'Starting capture with permission...';
@@ -281,13 +311,13 @@ function startLocalCapture(apiKey) {
     }
     
     console.log('Sidebar: Audio capture successful with permission');
-    startRecordingWithStream(stream, apiKey);
+    startRecordingWithStream(stream);
   });
 }
 
-function startRecordingWithStream(stream, apiKey) {
+function startRecordingWithStream(stream) { // API key is now from currentSettings
   currentStream = stream;
-  lastApiKey = apiKey;
+  // lastApiKey is already set from currentSettings.apiKey
   
   // Set up audio context and passthrough to maintain browser audio
   setupAudioPassthrough(stream);
@@ -329,27 +359,27 @@ function startRecordingWithStream(stream, apiKey) {
   
   // Update summary status and start summary timer
   summaryStatusElement.textContent = 'First summary in 2 minutes...';
-  startSummaryTimer(apiKey);
+  startSummaryTimer(); // API key is now from currentSettings
   
   // Start overlapping recording cycles for continuous audio
-  startOverlappingRecording(stream, recorderOptions, apiKey);
+  startOverlappingRecording(stream, recorderOptions); // API key is now from currentSettings
 }
 
-function startOverlappingRecording(stream, recorderOptions, apiKey) {
+function startOverlappingRecording(stream, recorderOptions) { // API key is now from currentSettings
   if (!isRecording) return;
   
   // Start first cycle immediately
-  startRecordingCycle(stream, recorderOptions, apiKey, 0);
+  startRecordingCycle(stream, recorderOptions, 0); // API key is now from currentSettings
   
   // Start second cycle 3 seconds later (50% overlap)
   setTimeout(() => {
     if (isRecording) {
-      startRecordingCycle(stream, recorderOptions, apiKey, 1);
+      startRecordingCycle(stream, recorderOptions, 1); // API key is now from currentSettings
     }
   }, 3000);
 }
 
-function startRecordingCycle(stream, recorderOptions, apiKey, cycleId) {
+function startRecordingCycle(stream, recorderOptions, cycleId) { // API key is now from currentSettings
   if (!isRecording) return;
   
   console.log(`Sidebar: Starting recording cycle ${cycleId} with options:`, recorderOptions);
@@ -360,7 +390,7 @@ function startRecordingCycle(stream, recorderOptions, apiKey, cycleId) {
     if (event.data && event.data.size > 0) {
       // Only transcribe if there was recent audio activity
       if (Date.now() - lastAudioTime < silenceTimeoutMs) {
-        transcribeAudio(event.data, apiKey);
+        transcribeAudio(event.data); // API key is now from currentSettings
         lastTranscriptionTime = Date.now(); // Update activity tracking
       } else {
         console.log(`Sidebar: Cycle ${cycleId} - Skipping transcription due to silence`);
@@ -369,7 +399,7 @@ function startRecordingCycle(stream, recorderOptions, apiKey, cycleId) {
     
     // Start next cycle with 6-second interval (overlapping)
     if (isRecording) {
-      setTimeout(() => startRecordingCycle(stream, recorderOptions, apiKey, cycleId), 6000);
+      setTimeout(() => startRecordingCycle(stream, recorderOptions, cycleId), 6000); // API key is now from currentSettings
     }
   };
   
@@ -377,7 +407,7 @@ function startRecordingCycle(stream, recorderOptions, apiKey, cycleId) {
     console.error(`Sidebar: Cycle ${cycleId} MediaRecorder error:`, event.error);
     if (isRecording) {
       // Try to restart this cycle on error
-      setTimeout(() => startRecordingCycle(stream, recorderOptions, apiKey, cycleId), 1000);
+      setTimeout(() => startRecordingCycle(stream, recorderOptions, cycleId), 1000); // API key is now from currentSettings
     }
   };
   
@@ -441,7 +471,7 @@ function stopLocalCapture() {
 }
 
 // Start summary timer with custom timing for first vs subsequent summaries
-function startSummaryTimer(apiKey) {
+function startSummaryTimer() { // API key is now from currentSettings
   if (summaryTimer) {
     clearTimeout(summaryTimer);
   }
@@ -451,7 +481,7 @@ function startSummaryTimer(apiKey) {
   
   summaryTimer = setTimeout(() => {
     if (isRecording && allTranscripts.length > 0) {
-      generateSummary(apiKey);
+      generateSummary(); // API key is now from currentSettings
     }
   }, delay);
 }
@@ -464,11 +494,14 @@ function stopSummaryTimer() {
 }
 
 // Generate live summary of transcripts
-async function generateSummary(apiKey) {
-  if (!isRecording || allTranscripts.length === 0) return;
+async function generateSummary() { // API key is now from currentSettings
+  if (!isRecording || allTranscripts.length === 0 || !currentSettings.apiKey) {
+    if (!currentSettings.apiKey) console.error('Sidebar: generateSummary - API key missing');
+    return;
+  }
   
   try {
-    console.log('Sidebar: Generating summary from', allTranscripts.length, 'transcript segments');
+    console.log('Sidebar: Generating summary from', allTranscripts.length, 'transcript segments using endpoint:', currentSettings.llmEndpoint);
     
     // Update status
     if (isFirstSummary) {
@@ -491,14 +524,14 @@ async function generateSummary(apiKey) {
     // Create summary prompt
     const summaryPrompt = `Please provide a concise summary of the following transcript in approximately ${currentSummaryWordCount} words. Focus on key topics, main points, and important information:\n\n${fullTranscript}`;
     
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch(currentSettings.llmEndpoint, {
       method: 'POST',
       headers: {
-        'Authorization': 'Bearer ' + apiKey,
+        'Authorization': 'Bearer ' + currentSettings.apiKey,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-3.5-turbo',
+        model: 'gpt-3.5-turbo', // This might need to be configurable too, or removed if endpoint implies model
         messages: [
           {
             role: 'user',
@@ -538,7 +571,7 @@ async function generateSummary(apiKey) {
     
     // Schedule next summary
     if (isRecording) {
-      startSummaryTimer(apiKey);
+      startSummaryTimer(); // API key is now from currentSettings
     }
     
   } catch (err) {
@@ -547,7 +580,7 @@ async function generateSummary(apiKey) {
     
     // Still schedule next attempt
     if (isRecording) {
-      startSummaryTimer(apiKey);
+      startSummaryTimer(); // API key is now from currentSettings
     }
   }
 }
@@ -656,8 +689,12 @@ function handleError(errorMessage) {
 }
 
 // Enhanced audio transcription with connection resilience
-async function transcribeAudio(blob, apiKey) {
-  console.log('Sidebar: Transcribing complete audio file, size:', blob.size, 'type:', blob.type);
+async function transcribeAudio(blob) { // API key is now from currentSettings
+  if (!currentSettings.apiKey) {
+    console.error('Sidebar: transcribeAudio - API key missing');
+    return;
+  }
+  console.log('Sidebar: Transcribing complete audio file, size:', blob.size, 'type:', blob.type, 'using endpoint:', currentSettings.whisperEndpoint);
   
   try {
     // Create form data with complete audio file
@@ -682,19 +719,19 @@ async function transcribeAudio(blob, apiKey) {
     const audioFile = new File([blob], filename, { type: fileType });
     
     formData.append('file', audioFile);
-    formData.append('model', 'whisper-1');
+    formData.append('model', 'whisper-1'); // This might need to be configurable or removed if endpoint implies model
     formData.append('response_format', 'text');
     
-    console.log('Sidebar: Sending complete file to OpenAI, file name:', audioFile.name, 'file type:', audioFile.type, 'size:', audioFile.size);
+    console.log('Sidebar: Sending complete file to endpoint, file name:', audioFile.name, 'file type:', audioFile.type, 'size:', audioFile.size);
     
     // Add timeout and abort controller for better reliability
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
     
-    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    const response = await fetch(currentSettings.whisperEndpoint, {
       method: 'POST',
       headers: { 
-        'Authorization': 'Bearer ' + apiKey 
+        'Authorization': 'Bearer ' + currentSettings.apiKey
       },
       body: formData,
       signal: controller.signal

@@ -2,6 +2,36 @@
 
 let activeTabId = null;
 let sidebarPort = null;
+let currentSettings = {
+  apiKey: null,
+  llmEndpoint: 'https://api.openai.com/v1/chat/completions', // Default OpenAI LLM
+  whisperEndpoint: 'https://api.openai.com/v1/audio/transcriptions' // Default OpenAI Whisper
+};
+
+// Function to load settings from storage
+async function loadSettings() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['openaiApiKey', 'llmEndpoint', 'whisperEndpoint'], (result) => {
+      currentSettings.apiKey = result.openaiApiKey || null;
+      currentSettings.llmEndpoint = result.llmEndpoint || 'https://api.openai.com/v1/chat/completions';
+      currentSettings.whisperEndpoint = result.whisperEndpoint || 'https://api.openai.com/v1/audio/transcriptions';
+      console.log('Background: Settings loaded:', currentSettings);
+      resolve();
+    });
+  });
+}
+
+// Listen for changes in storage and update settings
+chrome.storage.onChanged.addListener((changes, namespace) => {
+  if (namespace === 'local') {
+    console.log('Background: Storage changed, reloading settings...');
+    loadSettings().then(() => {
+      if (sidebarPort) {
+        sidebarPort.postMessage({ type: 'settingsUpdated', settings: currentSettings });
+      }
+    });
+  }
+});
 
 chrome.action.onClicked.addListener(async (tab) => {
   console.log('🔥🔥🔥 EXTENSION ICON CLICKED! Tab:', tab.id, tab.url);
@@ -55,19 +85,24 @@ chrome.runtime.onConnect.addListener((port) => {
     sidebarPort = port;
     console.log('Background: Sidebar connected');
     console.log('Background: Current activeTabId when sidebar connected:', activeTabId);
-    
-    if (activeTabId === null) {
-      console.log('⚠️⚠️⚠️ SIDEBAR OPENED WITHOUT CLICKING EXTENSION ICON! You must click the extension icon in the toolbar!');
-    }
-    
-    // If we already have permission, notify the sidebar
-    if (activeTabId) {
-      port.postMessage({ 
-        type: 'permissionStatusUpdate', 
-        hasPermission: true,
-        tabId: activeTabId 
-      });
-    }
+
+    // Load settings when sidebar connects
+    loadSettings().then(() => {
+      port.postMessage({ type: 'settingsUpdated', settings: currentSettings });
+
+      if (activeTabId === null) {
+        console.log('⚠️⚠️⚠️ SIDEBAR OPENED WITHOUT CLICKING EXTENSION ICON! You must click the extension icon in the toolbar!');
+      }
+
+      // If we already have permission, notify the sidebar
+      if (activeTabId) {
+        port.postMessage({
+          type: 'permissionStatusUpdate',
+          hasPermission: true,
+          tabId: activeTabId
+        });
+      }
+    });
     
     port.onMessage.addListener((message) => {
       console.log('Background: Received message:', message);
